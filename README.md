@@ -1,149 +1,142 @@
-# MinimaHop-Stacker: Molecular Stacking Optimizer
+# MinimaHop-Stacker
 
-A global optimization tool for finding the most stable stacking configurations of 2D materials (COFs, Graphene, MOFs) using the Minima Hopping algorithm.
+A global optimization tool that finds the most stable way to stack layers of 2D materials such as COFs, graphene and MOFs. It uses the Minima Hopping algorithm, with energies calculated by xtb.
 
-##  Overview
+## The problem
 
-Finding the optimal way two molecular layers sit on top of each other is difficult. The potential energy surface is rugged, filled with many "local minima" (shallow valleys) where a standard optimizer would get stuck.
+When you place one molecular layer on top of another, there are many possible positions, and most of them are only locally stable. The energy landscape is rough and full of shallow valleys, so an ordinary optimizer tends to settle in the first one it finds.
 
-This tool uses **Minima Hopping (MH)** to overcome this. It treats the optimization as a physical process where a system "hops" over energy barriers to explore the global landscape, automatically adjusting its "kinetic energy" (jump strength) and "temperature" (acceptance criteria) to avoid getting trapped.
+Minima Hopping gets around this by treating the search like a physical system that can jump over energy barriers. It changes the size of its jumps (its "kinetic energy") and how willing it is to accept a worse position (its "temperature") as it goes, so it does not get stuck.
 
-##  How It Works (The Logic)
+## What is being optimized
 
-The algorithm manipulates **7 parameters** (degrees of freedom) to define the position of the top layer relative to the bottom layer:
+The position of the top layer relative to the bottom layer is described by 7 parameters:
 
-| Parameter | Description |
-|-----------|-------------|
-| `Tx`, `Ty`, `Tz` | Translation (Shift X/Y, Vertical separation Z) |
-| `Cx`, `Cy` | Pivot point for rotation (Center of rotation) |
-| `cos_like`, `sin_like` | Rotation angle components (normalized) |
+| Parameter | Meaning |
+|-----------|---------|
+| `Tx`, `Ty`, `Tz` | shift in X and Y, and the vertical gap Z |
+| `Cx`, `Cy` | the point the layer rotates around |
+| `cos_like`, `sin_like` | the rotation angle, stored as two normalized parts |
 
-### The Algorithm: "The Blindfolded Hiker"
+## How one hop works
 
-We use a modified Minima Hopping approach involving three distinct phases for every "Hop":
+Each hop has three steps. A simple way to picture it is a hiker walking blindfolded through hills.
 
-1. **The Kick (Perturbation)**: Randomly shake the stack to escape the current valley.
-2. **The Slide (Local Quench)**: Systematically wiggle the stack to settle into the bottom of the new valley.
-3. **The Decision (Metropolis)**: Decide whether to stay in this new valley or return to the old one.
+1. **Kick.** Shake the stack at random to get out of the current valley.
+2. **Slide.** Nudge the stack step by step until it settles at the bottom of the new valley.
+3. **Decide.** Either stay in the new valley or go back to the old one.
 
-##  Code Walkthrough
+## How that looks in the code
 
-Here is how the physical theory maps directly to the Python code in `main.py`.
+The core code is in `scripts/main.py`.
 
-### 1. The "Kick" (Breaking the Stack)
+### 1. The kick
 
-To escape a local trap, we apply a random Gaussian perturbation to all 7 parameters. The strength of this kick depends on the system's current `ke` (Kinetic Energy).
+To get out of a local minimum, random Gaussian noise is added to all 7 parameters. How big the kick is depends on the current kinetic energy `ke`.
 
 ```python
-# From run_minima_hopping() loop
-# step: Calculated based on current Kinetic Energy (High KE = Large Step)
+# from the run_minima_hopping() loop
+# step size depends on the current kinetic energy (higher KE, bigger step)
 step = _step_scales(base, ke, cfg.mh.ke_ref_kj, lo, hi)
 
-# x: Current best coordinates
-# rng.normal: Adds random noise (The Kick)
+# x: current coordinates
+# rng.normal: the random kick
 x_prop = np.clip(x + rng.normal(0.0, step), lows, highs)
 ```
 
-### 2. The "Slide" (Pattern Search Refinement)
+### 2. The slide
 
-Once kicked, the structure is in a high-energy, chaotic state. We use a **Pattern Search (Hooke-Jeeves)** to slide it down to the nearest local minimum. This is a gradient-free method that tries moving every parameter up and down slightly to see if energy improves.
+After the kick the structure is in a high energy state. A Hooke-Jeeves pattern search brings it down to the nearest local minimum. It needs no gradients. It just tries moving each parameter a little up and a little down, and keeps any change that lowers the energy.
 
 ```python
-# From pattern_search_refine()
-for d in range(D): # For each of the 7 parameters
-    for sgn in (+1, -1): # Try adding AND subtracting
+# from pattern_search_refine()
+for d in range(D):           # for each of the 7 parameters
+    for sgn in (+1, -1):     # try a step up and a step down
         cand = x.copy()
-        cand[d] += sgn * step[d] 
-        
-        # Calculate Energy
+        cand[d] += sgn * step[d]
+
+        # calculate the energy
         f_cand = float(eval_fn(cand))
-        
-        # If Energy decreases (improved), keep the change
+
+        # keep the change if the energy went down
         if f_cand < fx - 1e-15:
             x, fx = cand, f_cand
             improved = True
 ```
 
-### 3. The "Decision" (Metropolis Criterion)
+### 3. The decision
 
-After sliding to a new local minimum, we decide if we keep it. If the new energy (`f_ref`) is lower, we always keep it. If it is higher, we might accept it based on the Temperature (`T`).
+Once the stack has settled into a new minimum, the Metropolis rule decides whether to keep it. A lower energy is always accepted. A higher energy is sometimes accepted, depending on the temperature `T`.
 
 ```python
-# From run_minima_hopping()
-delta = f_ref - fx  # Difference between New Energy and Old Energy
+# from run_minima_hopping()
+delta = f_ref - fx  # new energy minus old energy
 
-# _metropolis returns True if we should accept the move
-acc = _metropolis(delta, T, rng) 
+# _metropolis returns True if the move should be accepted
+acc = _metropolis(delta, T, rng)
 
 if acc:
-    # ACCEPTED: Increase KE slightly to surf the landscape
+    # accepted: raise KE a little to explore further
     ke = min(cfg.mh.ke_max_kj, max(cfg.mh.ke_min_kj, ke * cfg.mh.beta_up))
 else:
-    # REJECTED: Decrease KE to try a smaller, more careful jump next time
+    # rejected: lower KE and try a smaller jump next time
     ke = min(cfg.mh.ke_max_kj, max(cfg.mh.ke_min_kj, ke * cfg.mh.alpha_down))
 ```
 
 ## Installation
 
-### Prerequisites
+You need:
 
-- **Python 3.8+**
-- **Numpy**: `pip install numpy`
-- **xtb (Extended Tight Binding)**: This code relies on `xtb` for energy calculations. It must be installed and accessible in your system PATH.
-  - [Get xtb here](https://github.com/grimme-lab/xtb)
+- Python 3.8 or newer
+- NumPy (`pip install numpy`)
+- [xtb](https://github.com/grimme-lab/xtb), installed and available on your `PATH`. All energy calculations go through it.
 
-### Setup
-
-Clone the repository:
+Then clone the repo:
 
 ```bash
-git clone https://github.com/yourusername/minimahop-stacker.git
-cd minimahop-stacker
+git clone https://github.com/RoshanJSingh/MH.git
+cd MH
 ```
 
-##  Usage
+## Usage
 
-**Prepare your Input:**
-Place your monomer structure (single layer) in an `.xyz` file (e.g., `monomer.xyz`).
+Put your single-layer (monomer) structure in an `.xyz` file. `BTA.xyz` in the repo is an example.
 
-**Run the script:**
-You can run the script directly. Ensure you configure the `RunConfig` at the bottom of `main.py` if you want to change parameters.
-
-```python
-# Example in main.py
-config = RunConfig(
-    input_xyz="monomer.xyz",
-    objective_n=2,          # Number of layers to stack
-    outdir="results_run1"   # Output folder
-)
-run_minima_hopping(config)
-```
-
-**Execute:**
+Create a starting config for it:
 
 ```bash
-python main.py
+python scripts/run_mh.py --make-default --xyz BTA.xyz
 ```
 
-## 📂 Outputs
+This writes `BTA_config.json`. Edit it if you want to change the settings, then run:
 
-The script creates a directory (default: `mh_out`) containing:
+```bash
+python scripts/run_mh.py --config BTA_config.json
+```
 
-- **`local_minima.json`**: A ranked list of all unique stable structures found, including their energies and geometric parameters.
-- **`optimization_results.txt`**: A summary of the absolute best structure found.
-- **`energy_log.csv`**: A step-by-step trace of the algorithm (Energy, Temperature, Kinetic Energy per hop).
-- **`swarm_trace.csv`**: The exact coordinates of every attempt.
-- **`mh_localmin_XX_3layers.xyz`**: The actual 3D structure files for the top discovered minima. You can open these in VESTA, Avogadro, or Ovito.
+`input.json` in the repo is another example config. Set its `input_xyz` to your own file before using it.
 
-##  Advanced Configuration
+When the run finishes it prints the best energy, the number of distinct minima found and the output folder. Results from eight earlier runs on BTA are in `bta_runs/`.
 
-You can tweak the physics of the "Hiker" in the `MHConfig` class:
+## Outputs
+
+Each run writes a folder (`mh_out` by default) with:
+
+- `local_minima.json`: every distinct stable structure found, ranked, with its energy and parameters
+- `optimization_results.txt`: a summary of the best structure
+- `energy_log.csv`: energy, temperature and kinetic energy at every hop
+- `swarm_trace.csv`: the coordinates of every attempt
+- `mh_localmin_XX_3layers.xyz`: 3D structures of the best minima, which you can open in VESTA, Avogadro or Ovito
+
+## Tuning
+
+The behaviour of the search is set in the `MHConfig` class:
 
 ```python
 @dataclass
 class MHConfig:
-    n_hops: int = 20          # How many jumps to attempt
-    ke_start_kj: float = 2.3  # Initial kick strength
-    alpha_down: float = 0.9   # How much to reduce kick on rejection
-    beta_up: float = 1.15     # How much to boost kick on acceptance
+    n_hops: int = 20          # how many hops to try
+    ke_start_kj: float = 2.3  # starting kick size
+    alpha_down: float = 0.9   # how much to shrink the kick after a rejection
+    beta_up: float = 1.15     # how much to grow the kick after an acceptance
 ```
